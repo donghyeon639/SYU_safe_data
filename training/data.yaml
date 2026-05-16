@@ -1,0 +1,12 @@
+# Ultralytics YOLO dataset spec.
+# 클래스 id 는 0-indexed (YOLO 규약). convert_unreal_to_yolo.py 와 매핑 일치.
+
+path: datasets/safety
+train: images/train
+val:   images/val
+
+nc: 3
+names:
+  0: worker
+  1: helmet
+  2: vest
