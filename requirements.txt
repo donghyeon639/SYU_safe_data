@@ -1,0 +1,7 @@
+# torch 는 setup_env.ps1 에서 CUDA 버전에 맞게 별도 설치됩니다.
+# CPU 전용 수동 설치: pip install torch torchvision
+ultralytics>=8.3.0
+opencv-python>=4.9
+Pillow>=10.0
+tqdm>=4.66
+watchdog>=3.0.0

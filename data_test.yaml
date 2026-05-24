@@ -1,0 +1,12 @@
+# 테스트용 더미 데이터셋
+# python scripts/make_dummy_dataset.py 로 이미지/레이블 생성
+
+path: datasets/safety_test
+train: images/train
+val:   images/val
+
+nc: 3
+names:
+  0: worker
+  1: helmet
+  2: vest
