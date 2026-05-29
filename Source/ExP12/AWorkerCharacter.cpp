@@ -63,11 +63,6 @@ void AAWorkerCharacter::Tick(float DeltaTime)
 	}
 }
 
-void AAWorkerCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
-{
-	Super::SetupPlayerInputComponent(PlayerInputComponent);
-}
-
 // 리셋 시 호출 - 타이머 전부 취소하고 운반 오브젝트 즉시 분리
 void AAWorkerCharacter::ForceCleanup()
 {
@@ -75,16 +70,7 @@ void AAWorkerCharacter::ForceCleanup()
 	GetWorldTimerManager().ClearTimer(FallConfirmTimerHandle);
 	GetWorldTimerManager().ClearTimer(EdgeWalkTimerHandle);
 
-	if (CarriedMaterial)
-	{
-		CarriedMaterial->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
-		if (UStaticMeshComponent* SMC = CarriedMaterial->FindComponentByClass<UStaticMeshComponent>())
-		{
-			SMC->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-			SMC->SetSimulatePhysics(true);
-		}
-		CarriedMaterial = nullptr;
-	}
+	DetachCarriedMaterial();
 }
 
 // AIController에서 호출 - NavMesh 없이 랜덤 방향으로 직접 걷기 시작
@@ -131,7 +117,7 @@ void AAWorkerCharacter::StartCarrying(AActor* Material)
 	}
 
 	// 어깨 소켓에 자재 부착 (위치/회전만 스냅, 스케일은 원본 유지)
-	bool bAttached = Material->AttachToComponent(GetMesh(),
+	Material->AttachToComponent(GetMesh(),
 		FAttachmentTransformRules(EAttachmentRule::SnapToTarget, EAttachmentRule::SnapToTarget, EAttachmentRule::KeepWorld, false),
 		CarrySocketName);
 
@@ -176,21 +162,10 @@ void AAWorkerCharacter::DetachCarriedMaterial()
 	CarriedMaterial = nullptr;
 }
 
-void AAWorkerCharacter::TriggerFall()
+// TriggerFall/ConfirmFall 공통 처리 - 상태 전환 + AI 정지 + 사고 등록 + 래그돌 활성화
+void AAWorkerCharacter::EnterFallingState()
 {
-	if (WorkerState != EWorkerState::Wandering && WorkerState != EWorkerState::Carrying) return;
-
-	// 운반 중 낙하 시 자재 분리
-	if (CarriedMaterial)
-	{
-		CarriedMaterial->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
-		if (UStaticMeshComponent* SMC = CarriedMaterial->FindComponentByClass<UStaticMeshComponent>())
-		{
-			SMC->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-			SMC->SetSimulatePhysics(true);
-		}
-		CarriedMaterial = nullptr;
-	}
+	DetachCarriedMaterial();
 	if (CarryMontage)
 		StopAnimMontage(CarryMontage);
 
@@ -210,6 +185,13 @@ void AAWorkerCharacter::TriggerFall()
 	PendingEdgeAccidentId = -1;
 
 	ActivateRagdoll();
+}
+
+void AAWorkerCharacter::TriggerFall()
+{
+	if (WorkerState != EWorkerState::Wandering && WorkerState != EWorkerState::Carrying) return;
+
+	EnterFallingState();
 
 	FVector RandomDir = FVector(FMath::RandRange(-1.f, 1.f), FMath::RandRange(-1.f, 1.f), 0.f).GetSafeNormal();
 	GetMesh()->AddImpulse(RandomDir * 150.f + FVector(0, 0, 80.f), NAME_None, true);
@@ -253,42 +235,14 @@ void AAWorkerCharacter::OnMovementModeChanged(EMovementMode PrevMovementMode, ui
 	}
 }
 
-// 1초 이상 낙하 중이면 실제 낙하로 판정 → 래그돌 활성화
+// 0.3초 이상 낙하 중이면 실제 낙하로 판정 → 래그돌 활성화
 void AAWorkerCharacter::ConfirmFall()
 {
 	if (bSpawnImmunity) return;
 	if (GetCharacterMovement()->MovementMode != MOVE_Falling) return;
 	if (WorkerState != EWorkerState::Wandering && WorkerState != EWorkerState::Carrying) return;
 
-	if (CarriedMaterial)
-	{
-		CarriedMaterial->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
-		if (UStaticMeshComponent* SMC = CarriedMaterial->FindComponentByClass<UStaticMeshComponent>())
-		{
-			SMC->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-			SMC->SetSimulatePhysics(true);
-		}
-		CarriedMaterial = nullptr;
-	}
-	if (CarryMontage)
-		StopAnimMontage(CarryMontage);
-
-	WorkerState = EWorkerState::Falling;
-	bWalkingToEdge = false;
-	GetWorldTimerManager().ClearTimer(EdgeWalkTimerHandle);
-
-	if (AWorkerAIController* AIC = Cast<AWorkerAIController>(GetController()))
-		AIC->StopWandering();
-
-	// bWalkingToEdge 즉시 캡처 시 이미 OnWorkerFell 호출됨 → 중복 방지
-	if (PendingEdgeAccidentId < 0)
-	{
-		if (ASimGameMode* GM = Cast<ASimGameMode>(UGameplayStatics::GetGameMode(this)))
-			GM->OnWorkerFell(this);
-	}
-	PendingEdgeAccidentId = -1;
-
-	ActivateRagdoll();
+	EnterFallingState();
 }
 
 void AAWorkerCharacter::ActivateRagdoll()
@@ -297,6 +251,18 @@ void AAWorkerCharacter::ActivateRagdoll()
 	GetCharacterMovement()->StopMovementImmediately();
 	GetCapsuleComponent()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	GetMesh()->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+
+	// SetSimulatePhysics 전에 충돌 응답 설정 - 물리 시작 후 설정 시 첫 틱에 이미 관통 시작됨
+	// WorldDynamic 포함: 스캐폴딩 등 스폰된 구조물은 WorldStatic이 아닌 WorldDynamic 채널 사용
+	for (FBodyInstance* BI : GetMesh()->Bodies)
+	{
+		if (BI && BI->IsValidBodyInstance())
+		{
+			BI->SetResponseToChannel(ECC_WorldStatic, ECR_Block);
+			BI->SetResponseToChannel(ECC_WorldDynamic, ECR_Block);
+		}
+	}
+
 	GetMesh()->SetSimulatePhysics(true);
 
 	// 래그돌 전환 시 Leader Pose 팔로워를 GetMesh()로 re-attach

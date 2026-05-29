@@ -19,6 +19,16 @@
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
+#include "EngineUtils.h"
+
+// 사고 카메라 4방향 수평 오프셋 (N/E/S/W, 650cm) - PositionAccidentCameras/RepositionAccidentCameras 공용
+static const FVector AccidentCamDirOffsets[] =
+{
+	FVector(0.f,    650.f, 0.f),
+	FVector( 650.f,  0.f,  0.f),
+	FVector(0.f,   -650.f, 0.f),
+	FVector(-650.f,  0.f,  0.f),
+};
 
 ASimGameMode::ASimGameMode()
 {
@@ -44,7 +54,7 @@ void ASimGameMode::BeginPlay()
 		PC->SetInputMode(InputMode);
 	}
 
-	// 노멀/사고 카메라 두 세트 모두 생성 (BeginPlay에서 렌더러에 등록해야 정상 동작)
+	// BeginPlay에서 생성해야 렌더러에 즉시 등록됨
 	InitCaptureActors();
 }
 
@@ -79,6 +89,26 @@ bool ASimGameMode::GetRandomNavPointInXYRadius(UNavigationSystemV1* NavSys, FVec
 
 void ASimGameMode::StartSimulation(int32 NumWorkers)
 {
+	// 워커 소멸 전에 사고 상태 정리 - 타이머가 남아있는 채로 워커가 소멸되면
+	// t=5.0s 타이머가 IsValid(Worker) 체크에서 조기 반환하고 StopAccidentCameras를
+	// 호출하지 못해 bAccidentCamerasInUse가 true로 고착 → 이후 모든 사고 캡처 차단
+	for (auto& Pair : PendingCaptureTimers)
+		for (FTimerHandle& Handle : Pair.Value)
+			GetWorldTimerManager().ClearTimer(Handle);
+	PendingCaptureTimers.Empty();
+	AccidentInfoMap.Empty();
+	StopAccidentCameras();
+
+	// 레벨 내 모든 PrimitiveComponent의 SceneCapture 숨김 해제
+	// Hidden in Scene Capture 플래그가 켜진 메시가 있으면 캡처에서 투명하게 보이는 버그 발생
+	for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+	{
+		TArray<UPrimitiveComponent*> Prims;
+		It->GetComponents<UPrimitiveComponent>(Prims);
+		for (UPrimitiveComponent* Prim : Prims)
+			Prim->bHiddenInSceneCapture = false;
+	}
+
 	ClearWorkers();
 	ClearMaterials();
 
@@ -340,19 +370,35 @@ void ASimGameMode::InitCaptureActors()
 			Comp->ShowFlags.SetSkyLighting(true);
 			// Lumen GI가 SceneCapture2D에서 기본 비활성 → 명시적으로 켜야 간접광이 캡처에 포함됨
 			Comp->ShowFlags.SetGlobalIllumination(true);
+			// Landscape: SceneCapture2D에서 기본 비활성 → 미설정 시 지형이 투명하게 뚫려 보임
+			Comp->ShowFlags.SetLandscape(true);
+			// PostProcessing/EyeAdaptation: SceneCapture2D에서 기본 꺼져 있을 수 있음
+			// → 명시적으로 켜야 PostProcessSettings의 AutoExposure 설정이 적용됨
+			Comp->ShowFlags.SetPostProcessing(true);
+			Comp->ShowFlags.SetEyeAdaptation(true);
+			// PostProcessBlendWeight=1: 이 값이 0이면 Comp->PostProcessSettings 전체가 무시됨
+			Comp->PostProcessBlendWeight = 1.0f;
 
-			// UDS PostProcess Volume 설정 그대로 상속 (Method/Bias 직접 오버라이드 시 UDS 설정 파괴됨)
+			// AEM_Basic 강제 지정: UDS PostProcess Volume이 AEM_Histogram을 쓰면
+			// SceneCapture2D는 히스토그램 버퍼가 없어 AE가 완전히 망가짐 → 명시적 오버라이드 필수
+			Comp->PostProcessSettings.bOverride_AutoExposureMethod = true;
+			Comp->PostProcessSettings.AutoExposureMethod = AEM_Basic;
 			// SpeedUp/Down: 카메라 이동 후 첫 프레임에서 즉시 노출 수렴
-			// MinBrightness: 어두운 영역을 보는 카메라가 AE를 너무 올려 밝은 요소가 클리핑되는 현상 방지
-			// MaxBrightness: 너무 밝은 씬에서 AE가 지나치게 내려가 전체가 어두워지는 현상 방지
 			Comp->PostProcessSettings.bOverride_AutoExposureSpeedUp = true;
 			Comp->PostProcessSettings.AutoExposureSpeedUp = 65536.f;
 			Comp->PostProcessSettings.bOverride_AutoExposureSpeedDown = true;
 			Comp->PostProcessSettings.AutoExposureSpeedDown = 65536.f;
+			// MinBrightness: 0.005 → 스캐폴딩 그늘/야간 등 실제 루미넌스가 0.01 이하인 씬에서
+			// AE가 충분히 열릴 수 있도록 (0.05는 너무 높아 그늘진 실외도 어둡게 나옴)
 			Comp->PostProcessSettings.bOverride_AutoExposureMinBrightness = true;
-			Comp->PostProcessSettings.AutoExposureMinBrightness = 0.5f;
+			Comp->PostProcessSettings.AutoExposureMinBrightness = 0.005f;
+			// MaxBrightness: 너무 밝은 씬에서 AE가 지나치게 내려가 전체가 어두워지는 현상 방지
 			Comp->PostProcessSettings.bOverride_AutoExposureMaxBrightness = true;
 			Comp->PostProcessSettings.AutoExposureMaxBrightness = 4.0f;
+			// Bias=+4: AE가 씬을 어둡게 판단해도 강제로 4EV(16배) 밝게
+			// t=0.1s~t=5.0s 전체가 동일하게 어두울 때 가장 직접적인 수정
+			Comp->PostProcessSettings.bOverride_AutoExposureBias = true;
+			Comp->PostProcessSettings.AutoExposureBias = 3.3f;
 
 			UTextureRenderTarget2D* RT = UKismetRenderingLibrary::CreateRenderTarget2D(
 				GetWorld(), TexWidth, TexHeight, ETextureRenderTargetFormat::RTF_RGBA8);
@@ -379,14 +425,30 @@ FVector ASimGameMode::FindSafeCameraPosition(const FVector& FocusPoint, const FV
 		float SafeDist = Hit.Distance - 150.f;
 
 		// 300cm 미만으로 가까워지면 수직 상방 폴백 (벽에 막혀 워커에 너무 근접하는 경우)
+		// 원래 방향의 수평 성분 200cm 유지 → 4방향 카메라가 동일 위치로 수렴하는 버그 방지
 		if (SafeDist < 300.f)
 		{
+			FVector HorizOffset = DesiredPos - FocusPoint;
+			HorizOffset.Z = 0.f;
+			HorizOffset = HorizOffset.GetSafeNormal() * 200.f;
+
 			FVector VertPos = FocusPoint + FVector(0.f, 0.f, 700.f);
 			FHitResult VertHit;
+			FVector CandidatePos;
 			if (!GetWorld()->LineTraceSingleByChannel(VertHit, TraceStart, VertPos, ECC_WorldStatic, Params))
-				return VertPos;
-			// 수직도 막히면 천장 바로 아래
-			return TraceStart + FVector(0.f, 0.f, FMath::Max(VertHit.Distance - 100.f, 100.f));
+				CandidatePos = VertPos + HorizOffset;
+			else
+				CandidatePos = TraceStart + FVector(0.f, 0.f, FMath::Max(VertHit.Distance - 100.f, 100.f)) + HorizOffset;
+
+			// 폴백 위치가 구조물 내부인지 재검증 - 위에서 아래로 쏴서 즉시 막히면 내부
+			FHitResult ClearHit;
+			FVector ClearFrom = CandidatePos + FVector(0.f, 0.f, 50.f);
+			FVector ClearTo   = CandidatePos - FVector(0.f, 0.f, 50.f);
+			if (!GetWorld()->LineTraceSingleByChannel(ClearHit, ClearFrom, ClearTo, ECC_WorldStatic, Params))
+				return CandidatePos;
+
+			// 내부로 판정 → TraceStart 바로 위를 최후 폴백으로 사용
+			return TraceStart + FVector(0.f, 0.f, 300.f) + HorizOffset;
 		}
 
 		FVector Dir = (DesiredPos - TraceStart).GetSafeNormal();
@@ -442,24 +504,16 @@ void ASimGameMode::StopNormalCameras()
 	}
 }
 
-// OnWorkerFell 시 호출 - 낙하 위치 기준 배치 + bCaptureEveryFrame으로 Lumen 워밍업 시작
+// StartWalkToEdge 시 호출 - 낙하 위치 기준 배치 + bCaptureEveryFrame으로 Lumen 워밍업 시작
 // 사고 캡처 진행 중이면 호출 무시 (다른 캐릭터의 pre-warm이 카메라를 탈취하지 않도록)
 void ASimGameMode::PositionAccidentCameras(const FVector& FallLocation)
 {
-	static const FVector DirOffsets[] =
-	{
-		FVector(0.f,    400.f, 0.f),
-		FVector( 400.f,  0.f,  0.f),
-		FVector(0.f,   -400.f, 0.f),
-		FVector(-400.f,  0.f,  0.f),
-	};
-
 	if (bAccidentCamerasInUse) return;
 
 	for (int32 i = 0; i < AccidentCaptureActors.Num(); i++)
 	{
 		if (!IsValid(AccidentCaptureActors[i])) continue;
-		FVector DesiredPos = FallLocation + DirOffsets[i] + FVector(0.f, 0.f, 600.f);
+		FVector DesiredPos = FallLocation + AccidentCamDirOffsets[i] + FVector(0.f, 0.f, 600.f);
 		FVector CamPos = FindSafeCameraPosition(FallLocation, DesiredPos);
 		FRotator CamRot = (FallLocation - CamPos).Rotation();
 		AccidentCaptureActors[i]->SetActorLocationAndRotation(CamPos, CamRot);
@@ -467,11 +521,11 @@ void ASimGameMode::PositionAccidentCameras(const FVector& FallLocation)
 	}
 }
 
-// 사고 완료/취소 시 호출 - 노멀 카메라 위치로 복귀 (bCaptureEveryFrame 유지 → Lumen 계속 수렴)
-// StopNormalCameras 호출 시 비로소 꺼짐
-// 플래그 해제 → 다음 사고 캡처 허용
+// 사고 완료/취소 시 호출 - 노멀 카메라 위치로 복귀 + 플래그 해제
 void ASimGameMode::StopAccidentCameras()
 {
+	bAccidentCamerasInUse = false;
+
 	const FVector DirOffsets[] =
 	{
 		FVector(0.f,                  NormalCaptureRadius, 0.f),
@@ -479,8 +533,6 @@ void ASimGameMode::StopAccidentCameras()
 		FVector(0.f,                 -NormalCaptureRadius, 0.f),
 		FVector(-NormalCaptureRadius, 0.f,                 0.f),
 	};
-
-	bAccidentCamerasInUse = false;
 
 	for (int32 i = 0; i < 4 && i < AccidentCaptureActors.Num(); i++)
 	{
@@ -490,11 +542,11 @@ void ASimGameMode::StopAccidentCameras()
 	}
 }
 
-// 낙하 감지 시 호출 - 사고 카메라 워밍업 시작 + t=0.5/1.5/4.0초 캡처 예약
+// 낙하 감지 시 호출 - 사고 카메라 워밍업 시작 + t=0.1/0.3/7.0초 캡처 예약
 int32 ASimGameMode::OnWorkerFell(AActor* Worker)
 {
 	if (!IsValid(Worker)) return -1;
-	if (bAccidentCamerasInUse) return -1;	// 카메라 사용 중 → 이 사고는 스킵
+	if (bAccidentCamerasInUse) return -1;
 
 	bAccidentOccurred = true;
 	AccidentCount++;
@@ -510,29 +562,28 @@ int32 ASimGameMode::OnWorkerFell(AActor* Worker)
 	Info.TimeOfDay     = CurrentTimeOfDay;
 	AccidentInfoMap.Add(AccidentId, Info);
 
-	// 낙하 위치 기준 배치 - bAccidentCamerasInUse 설정 전 호출해야 내부 체크 통과
+	// 낙하 위치 기준 배치 - InUse 플래그 설정 전 호출해야 내부 early-return 통과
 	PositionAccidentCameras(Info.FallLocation);
 	bAccidentCamerasInUse = true;
 
-	static const float CaptureTimes[] = { 0.1f, 0.5f, 5.0f };
-	static const float TimeLabels[]   = { 0.1f, 0.5f, 5.0f };
+	static const float CaptureTimes[] = { 0.1f, 0.3f, 7.0f };
 
 	TArray<FTimerHandle>& Handles = PendingCaptureTimers.Add(AccidentId);
 	for (int32 k = 0; k < 3; k++)
 	{
 		FTimerHandle Handle;
 		FTimerDelegate Del;
-		Del.BindUFunction(this, FName("CaptureAccidentScreenshots"), Worker, TimeLabels[k], AccidentId);
+		Del.BindUFunction(this, FName("CaptureAccidentScreenshots"), Worker, CaptureTimes[k], AccidentId);
 		GetWorldTimerManager().SetTimer(Handle, Del, CaptureTimes[k], false);
 		Handles.Add(Handle);
 	}
 
-	// t=3.0s: 래그돌 최종 위치로 카메라 재배치 → 2.0초 Lumen+노출 워밍업 후 t=5.0s 캡처
+	// t=5.0s: 래그돌 최종 위치로 카메라 재배치 → 2.0초 Lumen+노출 워밍업 후 t=7.0s 캡처
 	{
 		FTimerHandle ReposHandle;
 		FTimerDelegate ReposDel;
-		ReposDel.BindUFunction(this, FName("RepositionAccidentCameras"), Worker);
-		GetWorldTimerManager().SetTimer(ReposHandle, ReposDel, 3.0f, false);
+		ReposDel.BindUFunction(this, FName("RepositionAccidentCameras"), Worker, AccidentId);
+		GetWorldTimerManager().SetTimer(ReposHandle, ReposDel, 5.0f, false);
 		Handles.Add(ReposHandle);
 	}
 
@@ -553,18 +604,18 @@ void ASimGameMode::CancelAccident(int32 AccidentId)
 	{
 		FString AccidentFolderPath = FPaths::ProjectSavedDir() + TEXT("Accidents/") + Info->Timestamp;
 		IFileManager::Get().DeleteDirectory(*AccidentFolderPath, false, true);
+		StopAccidentCameras();
 		AccidentInfoMap.Remove(AccidentId);
 	}
 
-	StopAccidentCameras();
 	AccidentCount--;
 }
 
-void ASimGameMode::RepositionAccidentCameras(AActor* Worker)
+void ASimGameMode::RepositionAccidentCameras(AActor* Worker, int32 AccidentId)
 {
 	if (!IsValid(Worker)) return;
+	if (!AccidentInfoMap.Contains(AccidentId)) return;
 
-	// 착지 위치 기준으로 카메라 재배치 (낙하 시작점 기준 → 착지점 기준으로 이동)
 	FVector LookAt = Worker->GetActorLocation();
 	if (AAWorkerCharacter* WC = Cast<AAWorkerCharacter>(Worker))
 	{
@@ -572,28 +623,21 @@ void ASimGameMode::RepositionAccidentCameras(AActor* Worker)
 			LookAt = Mesh->Bounds.GetBox().GetCenter();
 	}
 
-	static const FVector DirOffsets[] =
-	{
-		FVector(0.f,    400.f, 0.f),
-		FVector( 400.f,  0.f,  0.f),
-		FVector(0.f,   -400.f, 0.f),
-		FVector(-400.f,  0.f,  0.f),
-	};
-
 	for (int32 i = 0; i < AccidentCaptureActors.Num(); i++)
 	{
 		if (!IsValid(AccidentCaptureActors[i])) continue;
-		FVector DesiredPos = LookAt + DirOffsets[i] + FVector(0.f, 0.f, 350.f);
+		FVector DesiredPos = LookAt + AccidentCamDirOffsets[i] + FVector(0.f, 0.f, 350.f);
 		FVector CamPos = FindSafeCameraPosition(LookAt, DesiredPos);
 		AccidentCaptureActors[i]->SetActorLocationAndRotation(CamPos, (LookAt - CamPos).Rotation());
 	}
 }
 
-// 사고 카메라 세트로 4방향 캡처 + bbox 계산 + 기록 추가 (t=4.0s 완료 시 JSON 기록)
+// 사고 카메라 세트로 4방향 캡처 + bbox 계산 + 기록 추가 (t=7.0s 완료 시 JSON 기록)
 void ASimGameMode::CaptureAccidentScreenshots(AActor* Worker, float TimeOffsetSec, int32 AccidentId)
 {
 	if (!IsValid(Worker)) return;
 	if (!AccidentInfoMap.Contains(AccidentId)) return;
+
 	if (AccidentCaptureActors.Num() < 4) return;
 
 	FAccidentInfo& Info = AccidentInfoMap[AccidentId];
@@ -602,6 +646,9 @@ void ASimGameMode::CaptureAccidentScreenshots(AActor* Worker, float TimeOffsetSe
 	IFileManager::Get().MakeDirectory(*SaveDir, true);
 
 	static const TCHAR* DirNames[] = { TEXT("N"), TEXT("E"), TEXT("S"), TEXT("W") };
+
+	// 모든 RT를 읽기 전 렌더링 커맨드 일괄 플러시
+	FlushRenderingCommands();
 
 	for (int32 i = 0; i < 4; i++)
 	{
@@ -619,7 +666,8 @@ void ASimGameMode::CaptureAccidentScreenshots(AActor* Worker, float TimeOffsetSe
 		const float AspectRatio = 1280.f / 720.f;
 
 		// 래그돌 후에는 캡슐이 고정되어 GetActorBounds가 실제 메시 범위 미반영 → 메시 직접 참조
-		FVector Origin, BoxExtent;
+		FVector Origin = FVector::ZeroVector;
+		FVector BoxExtent = FVector::ZeroVector;
 		bool bUsedMesh = false;
 		if (AAWorkerCharacter* WC = Cast<AAWorkerCharacter>(Worker))
 		{
@@ -663,9 +711,6 @@ void ASimGameMode::CaptureAccidentScreenshots(AActor* Worker, float TimeOffsetSe
 			bIsOnScreen = true;
 		}
 
-		// bCaptureEveryFrame으로 RT가 이미 최신 상태 → FlushRenderingCommands로 동기화 후 읽기
-		FlushRenderingCommands();
-
 		FImage Image;
 		if (FImageUtils::GetRenderTargetImage(AccidentCaptureRTs[i], Image))
 		{
@@ -686,14 +731,14 @@ void ASimGameMode::CaptureAccidentScreenshots(AActor* Worker, float TimeOffsetSe
 		Info.CaptureRecords.Add(NewRecord);
 	}
 
-	if (TimeOffsetSec >= 5.0f)
+	if (TimeOffsetSec >= 7.0f)
 	{
 		WriteFinalAccidentJSON(AccidentId);
 		StopAccidentCameras();
 	}
 }
 
-// 모든 캡처(t=4.0s) 완료 후 호출 - 바운딩 박스 포함 JSON 기록, 메모리 정리
+// t=7.0s 캡처 완료 후 호출 - 바운딩 박스 포함 JSON 기록, 메모리 정리
 void ASimGameMode::WriteFinalAccidentJSON(int32 AccidentId)
 {
 	if (!AccidentInfoMap.Contains(AccidentId)) return;
@@ -752,12 +797,12 @@ void ASimGameMode::CaptureNormalScene()
 
 	static const TCHAR* DirNames[] = { TEXT("N"), TEXT("E"), TEXT("S"), TEXT("W") };
 
+	// 모든 RT를 읽기 전 렌더링 커맨드 일괄 플러시
+	FlushRenderingCommands();
+
 	for (int32 i = 0; i < 4; i++)
 	{
 		if (!IsValid(NormalCaptureActors[i])) continue;
-
-		// bCaptureEveryFrame으로 RT가 이미 최신 상태 → FlushRenderingCommands로 동기화 후 읽기
-		FlushRenderingCommands();
 
 		FImage Image;
 		if (FImageUtils::GetRenderTargetImage(NormalCaptureRTs[i], Image))
@@ -813,6 +858,7 @@ void ASimGameMode::StopAutoLoop()
 	GetWorldTimerManager().ClearTimer(AutoLoopEndTimerHandle);
 	GetWorldTimerManager().ClearTimer(NormalCaptureTimerHandle);
 	GetWorldTimerManager().ClearTimer(AutoLoopCountdownTimerHandle);
+	GetWorldTimerManager().ClearTimer(AutoLoopDelayTimerHandle);
 	StopNormalCameras();
 }
 
@@ -828,9 +874,7 @@ void ASimGameMode::AutoLoopCountdownTick()
 void ASimGameMode::AutoLoopTick()
 {
 	OnAutoIntervalReset();
-
-	FTimerHandle DelayHandle;
-	GetWorldTimerManager().SetTimer(DelayHandle, this, &ASimGameMode::AutoLoopDelayedReset, AutoResetDelay, false);
+	GetWorldTimerManager().SetTimer(AutoLoopDelayTimerHandle, this, &ASimGameMode::AutoLoopDelayedReset, AutoResetDelay, false);
 }
 
 void ASimGameMode::AutoLoopDelayedReset()

@@ -66,6 +66,7 @@ private:
 
 	void StopWalkToEdge();
 	void ActivateRagdoll();
+	void EnterFallingState();   // TriggerFall/ConfirmFall 공통 전환 처리
 	void ConfirmFall();
 	void DetachCarriedMaterial();
 

@@ -55,7 +55,7 @@ struct FAccidentInfo
 	UPROPERTY(BlueprintReadOnly)
 	float TimeOfDay = 1200.f;
 
-	// 0s, 0.5s, 4s 캡처 기록 배열 (바운딩 박스 포함)
+	// 0s, 0.3s, 7s 캡처 기록 배열 (바운딩 박스 포함)
 	UPROPERTY(BlueprintReadOnly)
 	TArray<FAccidentCaptureRecord> CaptureRecords;
 };
@@ -218,41 +218,42 @@ private:
 	UPROPERTY()
 	TArray<UTextureRenderTarget2D*> NormalCaptureRTs;
 
-	// ── 사고 캡처 전용 SceneCapture2D (OnWorkerFell 시점부터 워밍업 시작) ──
+	// ── 사고 캡처 전용 SceneCapture2D ──
 	UPROPERTY()
 	TArray<ASceneCapture2D*> AccidentCaptureActors;
 	UPROPERTY()
 	TArray<UTextureRenderTarget2D*> AccidentCaptureRTs;
 
-	void InitCaptureActors();           // 두 세트 모두 초기화 (BeginPlay)
-	void StartNormalCameras();          // NormalCaptureCenter 위치 배치 + bCaptureEveryFrame 시작
-	void StopNormalCameras();           // bCaptureEveryFrame 중지 + -10000 복귀
-	void StopAccidentCameras();         // 사고 완료/취소 시 정리
+	void InitCaptureActors();      // BeginPlay에서 노멀/사고 카메라 초기화
+	void StartNormalCameras();     // NormalCaptureCenter 위치 배치 + bCaptureEveryFrame 시작
+	void StopNormalCameras();      // bCaptureEveryFrame 중지 + -10000 복귀
+	void StopAccidentCameras();    // 사고 완료/취소 시 카메라 정리 + 플래그 해제
 
 	// TimeOffsetSec: 낙하 시작 기준 경과 시간 (파일명에 표기), AccidentId: 동일 사고의 3회 캡처를 하나로 묶는 키
 	UFUNCTION()
 	void CaptureAccidentScreenshots(AActor* Worker, float TimeOffsetSec, int32 AccidentId);
 
-	// t=3.5s에 호출 - 래그돌 현재 위치로 카메라 재배치 (t=4.0s 캡처 전 0.5초 Lumen 워밍업)
+	// t=5.0s에 호출 - 래그돌 현재 위치로 카메라 재배치 (t=7.0s 캡처 전 2초 Lumen 워밍업)
 	UFUNCTION()
-	void RepositionAccidentCameras(AActor* Worker);
+	void RepositionAccidentCameras(AActor* Worker, int32 AccidentId);
 
 	// 사고 정보 관리용 맵 (Key: AccidentId)
 	TMap<int32, FAccidentInfo> AccidentInfoMap;
 	TMap<int32, TArray<FTimerHandle>> PendingCaptureTimers;
 
-	// t=4.0s 캡처 완료 후 최종 JSON 기록 (바운딩 박스 포함)
+	// t=7.0s 캡처 완료 후 최종 JSON 기록 (바운딩 박스 포함)
 	void WriteFinalAccidentJSON(int32 AccidentId);
 
 	int32 LastNumWorkers = 5;
 	int32 PlayerCaptureCount = 0;
 	bool bAccidentOccurred = false;
-	bool bAccidentCamerasInUse = false;	// 사고 캡처 진행 중 → 다른 캐릭터의 카메라 탈취 방지
+	bool bAccidentCamerasInUse = false;
 
 	FTimerHandle NormalCaptureTimerHandle;
 	FTimerHandle AutoLoopIntervalTimerHandle;
 	FTimerHandle AutoLoopEndTimerHandle;
 	FTimerHandle AutoLoopCountdownTimerHandle;
+	FTimerHandle AutoLoopDelayTimerHandle;
 
 	float AutoLoopRemainingMinutes = 0.f;
 

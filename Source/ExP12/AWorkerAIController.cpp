@@ -62,8 +62,8 @@ void AWorkerAIController::OnMoveCompleted(FAIRequestID RequestID, const FPathFol
 			return;
 		}
 
-		// 30% 확률: 자재 든 채 가장자리 접근
-		if (FMath::RandRange(0, 9) < 3)
+		// 45% 확률: 자재 든 채 가장자리 접근
+		if (FMath::RandRange(0, 99) < 45)
 		{
 			CarryPhase = ECarryPhase::None;
 			TargetMaterial = nullptr;
@@ -97,22 +97,22 @@ void AWorkerAIController::OnMoveCompleted(FAIRequestID RequestID, const FPathFol
 
 	if (Result.IsSuccess())
 	{
-		int32 Roll = FMath::RandRange(0, 9);
-		if (Roll < 3)
+		int32 Roll = FMath::RandRange(0, 99);
+		if (Roll < 45)
 		{
-			// 30% 확률: 가장자리 접근
+			// 45% 확률: 가장자리 접근
 			float Pause = FMath::RandRange(0.5f, 1.5f);
 			GetWorld()->GetTimerManager().SetTimer(RetryTimerHandle, this, &AWorkerAIController::BeginEdgeApproach, Pause, false);
 			return;
 		}
-		if (Roll < 4)
+		if (Roll < 63)
 		{
-			// 20% 확률: 자재 운반 태스크
+			// 18% 확률: 자재 운반 태스크
 			float Pause = FMath::RandRange(0.5f, 1.5f);
 			GetWorld()->GetTimerManager().SetTimer(RetryTimerHandle, this, &AWorkerAIController::BeginCarryTask, Pause, false);
 			return;
 		}
-		// 60%: 일반 배회 계속
+		// 37%: 일반 배회 계속
 		float Pause = FMath::RandRange(3.0f, 8.0f);
 		GetWorld()->GetTimerManager().SetTimer(RetryTimerHandle, this, &AWorkerAIController::MoveToNextRandomPoint, Pause, false);
 	}
