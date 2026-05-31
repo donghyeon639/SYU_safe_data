@@ -111,6 +111,23 @@ def collect_jobs(scenes_dir: Path) -> list[tuple[Path, str]]:
     return jobs
 
 
+MANIFEST_FILE = ".split_manifest.json"
+
+
+def load_manifest(output: Path) -> dict[str, str]:
+    """이전 실행에서 배정된 stem → split 매핑 로드."""
+    p = output / MANIFEST_FILE
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_manifest(output: Path, manifest: dict[str, str]) -> None:
+    (output / MANIFEST_FILE).write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 def write_split(jobs: list[tuple[Path, str]], img_dir: Path, lbl_dir: Path) -> None:
     img_dir.mkdir(parents=True, exist_ok=True)
     lbl_dir.mkdir(parents=True, exist_ok=True)
@@ -131,7 +148,9 @@ def main() -> None:
     if not source.is_dir():
         sys.exit(f"[ERR] source 없음: {source}")
 
-    acc_jobs  = collect_jobs(source / "AccidentScreenshots")
+    # UE5 프로젝트가 "Accidents" 또는 "AccidentScreenshots" 두 이름 모두 허용
+    acc_dir = source / "Accidents" if (source / "Accidents").is_dir() else source / "AccidentScreenshots"
+    acc_jobs  = collect_jobs(acc_dir)
     norm_jobs = collect_jobs(source / "NormalScreenshots")
     all_jobs  = acc_jobs + norm_jobs
 
@@ -144,13 +163,39 @@ def main() -> None:
     print(f"bbox 있는 이미지 : {labeled}장 / {len(all_jobs)}장")
 
     if labeled == 0:
-        print("\n[경고] bbox 데이터가 없습니다. UE5 팀의 어노테이션 작업 완료 후 다시 실행하세요.")
+        print("\n[경고] bbox 데이터가 없습니다.")
+
+    # ── 매니페스트 기반 split 배정 ────────────────────────────────────────────
+    # 이전 실행에서 배정된 이미지는 고정 유지, 새 이미지만 val_ratio 비율로 배정
+    manifest = load_manifest(output)
+
+    train_jobs: list[tuple[Path, str]] = []
+    val_jobs:   list[tuple[Path, str]] = []
+    new_jobs:   list[tuple[Path, str, str]] = []
+
+    for img_path, label in all_jobs:
+        stem = f"{img_path.parent.name}__{img_path.stem}"
+        if stem in manifest:
+            (train_jobs if manifest[stem] == "train" else val_jobs).append((img_path, label))
+        else:
+            new_jobs.append((img_path, label, stem))
 
     rng = random.Random(args.seed)
-    rng.shuffle(all_jobs)
-    n_val = max(1, int(round(len(all_jobs) * args.val_ratio)))
-    splits = {"val": all_jobs[:n_val], "train": all_jobs[n_val:]}
+    rng.shuffle(new_jobs)
+    n_val_new = max(0, int(round(len(new_jobs) * args.val_ratio)))
 
+    for i, (img_path, label, stem) in enumerate(new_jobs):
+        if i < n_val_new:
+            val_jobs.append((img_path, label))
+            manifest[stem] = "val"
+        else:
+            train_jobs.append((img_path, label))
+            manifest[stem] = "train"
+
+    output.mkdir(parents=True, exist_ok=True)
+    save_manifest(output, manifest)
+
+    splits = {"train": train_jobs, "val": val_jobs}
     for split, jobs in splits.items():
         write_split(jobs, output / "images" / split, output / "labels" / split)
         print(f"  {split}: {len(jobs)}장")
