@@ -17,10 +17,11 @@ Write-Host "학습 device: $device"
 
 yolo detect train `
     model=yolo11m.pt `
-    data=data.yaml `
+    data="$LEARN_DIR\data.yaml" `
     epochs=60 `
     imgsz=640 `
     batch=4 `
     device=$device `
-    project=output `
-    name=yolo11m_safety
+    project="$LEARN_DIR\output" `
+    name=yolo11m_safety `
+    exist_ok=True
